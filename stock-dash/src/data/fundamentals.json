@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "generatedAt": "2026-06-30",
+    "source": "Financial Modeling Prep (financialmodelingprep.com)",
+    "scope": "미국 개별주만. ETF·한국(.KS)·미커버 종목(AVGO 등)은 제외.",
+    "note": "참고용 펀더멘털 스냅샷. 추천 점수에 반영되지 않음. 갱신: FMP_API_KEY=... node scripts/fetch-fundamentals.mjs"
+  },
+  "data": {
+    "NVDA": { "per": 30.09, "pbr": 24.52, "peg": 0.28, "divYield": 0.00142, "targetConsensus": 316.79, "targetHigh": 500, "targetLow": 218, "currency": "USD" },
+    "TSLA": { "per": 344.49, "pbr": 15.94, "peg": -8.81, "divYield": 0, "targetConsensus": 440.7, "targetHigh": 540, "targetLow": 360, "currency": "USD" },
+    "AAPL": { "per": 34.43, "pbr": 39.43, "peg": 1.19, "divYield": 0.00368, "targetConsensus": 327, "targetHigh": 400, "targetLow": 253, "currency": "USD" },
+    "MSFT": { "per": 22.08, "pbr": 6.67, "peg": 0.74, "divYield": 0.00957, "targetConsensus": 551.33, "targetHigh": 680, "targetLow": 400, "currency": "USD" },
+    "GOOGL": { "per": 26.72, "pbr": 8.94, "peg": 0.58, "divYield": 0.0024, "targetConsensus": 413.4, "targetHigh": 460, "targetLow": 360, "currency": "USD" },
+    "AMZN": { "per": 28.21, "pbr": 5.82, "peg": 0.80, "divYield": 0, "targetConsensus": 307.77, "targetHigh": 330, "targetLow": 175, "currency": "USD" }
+  }
+}
