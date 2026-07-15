@@ -22,7 +22,7 @@ const TMP = path.join(HERE, ".backtest-cli.gen.mjs"); // 번들 산출물(즉시
 const patched =
   fs.readFileSync(SRC, "utf8") +
   "\nexport { computeIndicators, computeSignal, backtestSeries, aggregateBacktest, btRegimeMap," +
-  " benchmarkFor, btCostOf, BT_HOLD, BT_WARMUP, BT_RANGE, BT_REGIME_RANGE, BT_REGIME_MIN_BARS, WATCHLIST };\n";
+  " benchmarkFor, btCostOf, isLiveBar, BT_HOLD, BT_WARMUP, BT_RANGE, BT_REGIME_RANGE, BT_REGIME_MIN_BARS, WATCHLIST };\n";
 
 const res = await esbuild.build({
   stdin: { contents: patched, loader: "jsx", resolveDir: path.join(ROOT, "src"), sourcefile: "StockDashboard.jsx" },
@@ -44,18 +44,33 @@ fs.unlinkSync(TMP);
 const RANGE = process.argv.find((a) => a.startsWith("--range="))?.slice(8) || M.BT_RANGE;
 
 // Yahoo 일봉 직접 호출 (앱은 브라우저라 프록시를 쓰지만 Node는 직접 된다)
+//
+// ⚠️ 장중 미완성 봉은 잘라낸다 — 앱의 채점용 fetchSeries와 **같은 규칙**이다(U1).
+//  왜: Yahoo는 장중에도 오늘 봉을 시계열에 넣고 그 종가 자리에 '현재가'를 채운다.
+//   그대로 두면 아직 안 끝난 종가가 마지막 진입 몇 건의 청산가로 새어 들어가,
+//   같은 코드로 두 번 돌려도 결과가 미세하게 달라진다(실측 확인).
+//  판정은 재구현하지 않고 앱의 isLiveBar를 그대로 꺼내 쓴다 — CLI가 검증해야 하는 건
+//   '앱'이지 '복제본'이 아니다.
+//  ↳ 그래서 이 CLI는 **장 마감 후에 돌리면** 잘라낼 봉이 없어 결과가 재현 가능하다.
+//    무변경 회귀 검증(출력 동일)은 반드시 장 마감 후에 할 것.
 async function fetchSeries(symbol, range = RANGE) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=1d`;
   const j = await (await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } })).json();
   const r = j?.chart?.result?.[0];
   if (!r) return [];
   const q = r.indicators.quote[0];
-  return r.timestamp
-    .map((t, i) => ({
-      date: new Date(t * 1000).toISOString().slice(0, 10),
+  const rows = [];
+  let lastTs = null; // 살아남은 마지막 봉의 timestamp (미완성 판정용)
+  for (let i = 0; i < r.timestamp.length; i++) {
+    if (q.close[i] == null || q.high[i] == null || q.low[i] == null) continue;
+    rows.push({
+      date: new Date(r.timestamp[i] * 1000).toISOString().slice(0, 10),
       open: q.open[i], high: q.high[i], low: q.low[i], close: q.close[i], volume: q.volume[i],
-    }))
-    .filter((x) => x.close != null && x.high != null && x.low != null);
+    });
+    lastTs = r.timestamp[i];
+  }
+  if (rows.length && M.isLiveBar(r.meta, lastTs)) rows.pop();
+  return rows;
 }
 
 // 벤치마크 200일선으로 진입 시점의 레짐(강세장/약세장)을 판정한다 — 앱과 같은 방식.

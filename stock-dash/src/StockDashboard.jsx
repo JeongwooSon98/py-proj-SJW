@@ -137,12 +137,42 @@ function fmtYmd(epochSec) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-// 지정 기간/간격의 시계열 (지표 계산용)
-async function fetchSeries(symbol, range = "3y", interval = "1d") {
+// 지금이 그 종목의 **정규장 시간**인지 판정한다(시계 vs 거래소 정규장 구간. 봉과 무관).
+//  ⚠️ 거래시간은 시장마다 다르다(미국 ↔ KRX). KST 시각을 하드코딩하지 말 것 —
+//   meta가 주는 거래소 기준 구간(currentTradingPeriod.regular)만 쓴다.
+//  판정에 실패하면(필드 없음) 보수적으로 '장중'으로 본다(→ stale 보정을 걸어 잠그고
+//   배지를 띄운다. 흔들리는 점수보다 하루 늦은 점수가 낫다).
+function isInSession(meta) {
+  const reg = meta?.currentTradingPeriod?.regular;
+  if (!reg || reg.start == null || reg.end == null) return true;
+  const now = Math.floor(Date.now() / 1000);
+  return now >= reg.start && now < reg.end;
+}
+
+// 마지막 일봉이 아직 '진행 중'(장중 미완성)인지 판정한다.
+//  왜 필요한가: Yahoo는 장중에 그날의 봉을 시계열에 넣고, 그 종가 자리에 '현재가'를
+//  채워 준다. 이 봉으로 채점하면 신호가 켜졌다 꺼졌다 한다(repaint).
+//  ⚠️ isInSession과 다르다. '장중'이어도 마지막 봉이 어제일 수 있다(예: .KS는 장중에
+//   오늘 봉 close가 null로 와서 걸러진다). 그 경우 여기서는 false(잘라낼 봉이 없음)지만
+//   여전히 장중이므로 stale 보정은 별도로 isInSession으로 막는다(loadSeries 참고).
+function isLiveBar(meta, lastTs) {
+  const reg = meta?.currentTradingPeriod?.regular;
+  if (!reg || reg.start == null || reg.end == null || lastTs == null) return true;
+  // 지금이 정규장 구간 안이고, 마지막 봉이 '그 세션의 봉'이면 아직 안 끝난 봉이다.
+  //  (일봉의 timestamp는 그날 정규장 시작 시각이라 reg.start와 같은 값이 된다)
+  return isInSession(meta) && lastTs >= reg.start;
+}
+
+// 지정 기간/간격의 시계열 + 마지막 봉이 미완성인지 여부.
+//  호출부는 이 함수를 직접 쓰지 말고 아래 둘 중 하나를 쓴다:
+//   ▸ fetchSeries     — 채점·백테스트용 (완성 봉만)
+//   ▸ fetchSeriesLive — 차트·현재가 표시용 (미완성 봉 포함)
+async function loadSeries(symbol, range = "3y", interval = "1d") {
   const result = await fetchChart(symbol, range, interval);
   const ts = result.timestamp || [];
   const q = result.indicators?.quote?.[0] || {};
   const rows = [];
+  let lastTs = null;
   for (let i = 0; i < ts.length; i++) {
     const o = q.open?.[i];
     const h = q.high?.[i];
@@ -158,14 +188,26 @@ async function fetchSeries(symbol, range = "3y", interval = "1d") {
       close: c,
       volume: v != null ? v : 0,
     });
+    lastTs = ts[i];
   }
 
-  // 시계열 지연(stale) / 장중 미완성 봉 보정 (일봉 한정).
-  //  일부 종목(특히 .KS)은 일봉 시계열이 며칠 뒤처져, 지표가 묵은 종가로 계산된다.
-  //  meta의 현재가가 시계열 마지막 종가와 다르면 마지막 봉 종가를 현재가로 갱신해
-  //  지표를 최신화한다. (새 봉을 추가하면 미국 거래일↔KST 타임존 경계에서 중복
-  //   봉이 생기므로, 봉을 늘리지 않고 마지막 봉만 갱신해 타임존과 무관하게 처리)
-  if (interval === "1d" && rows.length) {
+  if (interval !== "1d" || !rows.length)
+    return { rows, live: false, inSession: false, livePrice: null };
+
+  const inSession = isInSession(result.meta);
+  const live = isLiveBar(result.meta, lastTs);
+  // 장중 현재가 — 표시 전용(배지·차트). 장중이 아니면 없음.
+  const livePrice = inSession ? result.meta?.regularMarketPrice ?? null : null;
+
+  // 시계열 지연(stale) 보정 — '장중 미완성 봉'과는 **다른 문제**다. 분기를 섞지 말 것.
+  //  증상: 정규장이 끝났는데도 일부 종목(특히 .KS)은 그날 봉의 close가 null로 와서
+  //   위 루프에서 통째로 걸러진다. 그러면 마지막 봉이 하루 뒤처지고, 지표가 묵은
+  //   종가로 계산된다. 이때만 마지막(완성) 봉의 종가를 meta 현재가로 갱신해 최신화한다.
+  //  ⚠️ 봉을 새로 추가하지는 않는다 — 미국 거래일↔KST 타임존 경계에서 중복 봉이 생긴다.
+  //  ⚠️ **장중(inSession)에는 절대 하지 않는다.** .KS는 장중에 오늘 봉 close가 null로
+  //   빠져 마지막 봉이 '어제'가 되는데(→ live=false), 그때 덮어쓰면 어제 봉에 실시간가가
+  //   들어가 점수가 흔들린다(KRX 장중 repaint). 그래서 조건이 !live가 아니라 !inSession이다.
+  if (!inSession) {
     const price = result.meta?.regularMarketPrice;
     const last = rows[rows.length - 1];
     if (price != null && price !== last.close) {
@@ -175,7 +217,21 @@ async function fetchSeries(symbol, range = "3y", interval = "1d") {
     }
   }
 
+  return { rows, live, inSession, livePrice };
+}
+
+// 채점·백테스트용 시계열 — **완성된 봉만**. 장중이면 진행 중인 마지막 봉을 잘라낸다.
+//  이래야 백테스트가 검증한 것과 화면이 보여주는 것이 같은 물건이 된다.
+async function fetchSeries(symbol, range = "3y", interval = "1d") {
+  const { rows, live } = await loadSeries(symbol, range, interval);
+  if (live) rows.pop();
   return rows;
+}
+
+// 차트·현재가 표시용 시계열 — 장중 미완성 봉을 그대로 포함한다(현재가 확인용).
+//  { rows, live } 를 그대로 돌려주므로, 호출부는 live일 때 미완성 봉을 구분해 표시한다.
+async function fetchSeriesLive(symbol, range = "3y", interval = "1d") {
+  return loadSeries(symbol, range, interval);
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,7 +337,13 @@ async function loadAllSignals() {
   const results = [];
   for (const w of WATCHLIST) {
     try {
-      const rows = await fetchSeries(w.symbol, "1y", "1d");
+      // 채점은 **완성 봉만** 쓴다(장중 repaint 방지). 장중 현재가(livePrice)는 채점에
+      //  넣지 않고 카드의 '장중 배지'에만 표시한다 — 사실/채점 분리.
+      //  ⚠️ 배지 판정은 live(마지막 봉이 미완성 봉인가)가 아니라 inSession(지금이 정규장인가)이다.
+      //   .KS는 장중에도 오늘 봉이 null로 빠져 live=false가 될 수 있는데, 그래도 '장중'이다.
+      const { rows: liveRows, live, inSession, livePrice } = await loadSeries(w.symbol, "1y", "1d");
+      const rows = live ? liveRows.slice(0, -1) : liveRows;
+      if (!rows.length) continue;
       const ind = computeIndicators(rows);
 
       // 주봉 추세 (멀티 타임프레임). 실패해도 일봉 신호는 진행
@@ -316,12 +378,110 @@ async function loadAllSignals() {
         regimeRisk,
         regimeBull,
       });
-      if (sig) results.push({ ...w, ...sig });
+      // barDate = 채점 기준이 된 완성 봉의 날짜. 카드의 모든 수치(점수·RSI·손절·목표)가
+      //  이 봉 기준이다. intraday면 화면의 현재가(livePrice)와 기준 봉이 다르다는 뜻.
+      if (sig)
+        results.push({
+          ...w,
+          ...sig,
+          intraday: inSession,
+          livePrice,
+          barDate: rows[rows.length - 1].date,
+        });
     } catch {
       // 개별 종목 실패는 건너뜀
     }
   }
   return results;
+}
+
+/* ------------------------------------------------------------------ */
+/*  변화 감지 (U3) — 직전 완성 봉 대비 무엇이 바뀌었나 (예측 아님, 사실)        */
+/* ------------------------------------------------------------------ */
+// localStorage에 '직전 완성 봉'의 점수·신호 라벨을 종목별로 저장해, 오늘과의 차이를
+//  사실로만 보여준다. 키는 완성 봉 날짜(barDate)다 — U1이 선행돼야 하는 이유. 장중
+//  미완성 봉을 저장하면 델타가 하루 종일 요동친다.
+//  기준(prev)은 '하루 동안 고정'된다: 같은 barDate로 여러 번 열어도 델타가 안 바뀐다.
+//  새 봉이 닫히면(barDate 전진) 직전 cur를 prev로 굴린다.
+//  ⚠️ 문구 규칙(REFRAME R1~R4): "새 기회" 같은 말 금지. "어제 없던 신호"처럼 사실만.
+const SNAP_KEY = "stockdash.signalSnap.v1";
+const SNAP_EXPOSED = 3; // 노출 임계(±3)와 동일 — 목록 진입/이탈 판정용
+
+function readSnap() {
+  try {
+    return JSON.parse(localStorage.getItem(SNAP_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+function writeSnap(snap) {
+  try {
+    localStorage.setItem(SNAP_KEY, JSON.stringify(snap));
+  } catch {
+    /* 용량 초과 등은 무시(변화 감지는 보조 기능) */
+  }
+}
+
+// 카드에 실제로 보이는(우세 방향) 신호 라벨 목록. 델타의 '신호' 비교 단위.
+function activeLabels(item) {
+  const rs = item.score >= 0 ? item.buy : item.sell;
+  return (rs || []).map((r) => r.label);
+}
+
+// data(loadAllSignals 결과)에 종목별 델타를 붙이고, 저장할 다음 스냅샷과 패널 요약을 만든다.
+//  순수 계산 + localStorage '읽기'만 한다(쓰기는 호출부 useEffect에서). 같은 data로 여러
+//  번 불려도 idempotent다(barDate가 같으면 스냅샷을 굴리지 않으므로).
+function computeDeltas(data) {
+  if (!data) return { items: null, summary: null, nextSnap: null };
+  const prevSnap = readSnap();
+  const nextSnap = { ...prevSnap };
+
+  const items = data.map((item) => {
+    const cur = { barDate: item.barDate, score: item.score, labels: activeLabels(item) };
+    const e = prevSnap[item.symbol];
+    let baseline = null; // 비교 기준(직전 완성 봉의 상태)
+    if (!e) {
+      // 첫 조회 — 기준 없음. 저장만 해 둔다(델타는 표시하지 않는다).
+      nextSnap[item.symbol] = { curBarDate: cur.barDate, cur, prevBarDate: null, prev: null };
+    } else if (e.curBarDate === cur.barDate) {
+      // 같은 완성 봉 — 하루 동안 기준 고정. prev가 있으면 그것과 비교.
+      baseline = e.prev || null;
+    } else {
+      // 새 완성 봉 — 직전 cur를 prev로 굴린다.
+      baseline = e.cur;
+      nextSnap[item.symbol] = {
+        curBarDate: cur.barDate,
+        cur,
+        prevBarDate: e.curBarDate,
+        prev: e.cur,
+      };
+    }
+    let delta = null;
+    if (baseline) {
+      const newLabels = cur.labels.filter((l) => !baseline.labels.includes(l));
+      delta = { baseDate: baseline.barDate, scoreDelta: cur.score - baseline.score, newLabels };
+    }
+    return { ...item, delta };
+  });
+
+  // 패널 요약: 어제 노출(±3) → 오늘 빠짐 / 어제 안 뜸 → 오늘 노출.
+  //  baseline.score = 현재 점수 − scoreDelta 로 복원(스냅샷 내부 구조에 의존하지 않음).
+  const newlyExposed = [];
+  const dropped = [];
+  let baseDate = null;
+  for (const it of items) {
+    if (!it.delta) continue;
+    baseDate = it.delta.baseDate;
+    const prevScore = it.score - it.delta.scoreDelta;
+    const prevExposed = Math.abs(prevScore) >= SNAP_EXPOSED;
+    const curExposed = Math.abs(it.score) >= SNAP_EXPOSED;
+    if (curExposed && !prevExposed)
+      newlyExposed.push({ symbol: it.symbol, name: it.name, score: it.score });
+    if (!curExposed && prevExposed)
+      dropped.push({ symbol: it.symbol, name: it.name, prevScore });
+  }
+  const summary = baseDate ? { baseDate, newlyExposed, dropped } : null;
+  return { items, summary, nextSnap };
 }
 
 function useSignals() {
@@ -1894,11 +2054,25 @@ function ChartPanel({ symbol, highlight }) {
     let alive = true;
     setData(null);
     setErr(false);
-    fetchSeries(symbol, range, interval)
-      .then((rows) => {
+    // 차트는 **표시 경로**라 장중 미완성 봉을 그대로 그린다(현재가 확인용).
+    //  단, 그 봉에는 신호 마커(스토캐스틱 크로스·다이버전스)를 찍지 않는다 —
+    //  미완성 봉의 마커는 종가에 사라질 수 있어(repaint) '지나간 자리'로 오독된다.
+    //  채점(신호 종합 패널)은 이 봉을 아예 쓰지 않는다(fetchSeries).
+    fetchSeriesLive(symbol, range, interval)
+      .then(({ rows, live }) => {
         if (!alive) return;
         if (!rows.length) throw new Error("empty");
-        setData(computeIndicators(rows));
+        const ind = computeIndicators(rows);
+        if (live && ind.length) {
+          const i = ind.length - 1;
+          ind[i] = {
+            ...ind[i],
+            stochMarkerY: undefined,
+            rsiDivY: undefined,
+            macdDivY: undefined,
+          };
+        }
+        setData(ind);
       })
       .catch(() => alive && setErr(true));
     return () => {
@@ -2347,7 +2521,7 @@ function freshText(fresh) {
 // 신호 근거 배지. 차트로 위치를 짚을 수 있는 신호는 클릭 시 차트 이동(↗),
 // 차트로 못 짚는 신호(시장 대비 RS 등)는 클릭 시 이유·의미 설명 팝오버(ⓘ).
 // 어느 배지든 마우스를 올리면(hover) 그 신호의 의미를 짧은 툴팁으로 보여준다.
-function ReasonBadge({ symbol, reason, color, onReasonClick }) {
+function ReasonBadge({ symbol, reason, color, onReasonClick, isNew }) {
   const [showInfo, setShowInfo] = useState(false);
   const [hover, setHover] = useState(false);
   const chartClickable = !!(reason.chart && reason.date && onReasonClick);
@@ -2388,6 +2562,11 @@ function ReasonBadge({ symbol, reason, color, onReasonClick }) {
           cursor: clickable ? "pointer" : "default",
         }}
       >
+        {isNew && (
+          <span style={styles.newTag} title="직전 완성 봉엔 없던 신호입니다">
+            🆕{" "}
+          </span>
+        )}
         {reason.label}{" "}
         <b style={{ fontVariantNumeric: "tabular-nums" }}>
           ({reason.points > 0 ? `+${reason.points}` : reason.points})
@@ -2631,6 +2810,10 @@ function SignalCard({ item, onReasonClick }) {
   const reasons = item.score >= 0 ? item.buy : item.sell;
   const verdict = todayVerdict(item);
   const [showBreakdown, setShowBreakdown] = useState(false);
+  const [showRecord, setShowRecord] = useState(false);
+  // 변화 감지(U3): 직전 완성 봉 대비 점수 변화. 첫 조회면 delta=null → 표시 안 함.
+  const d = item.delta;
+  const newLabels = d ? d.newLabels : [];
   return (
     <div style={styles.sigCard}>
       <div style={styles.sigHead}>
@@ -2644,6 +2827,14 @@ function SignalCard({ item, onReasonClick }) {
         <span style={{ color: "#777" }}>
           RSI {item.rsi != null ? fmtNum(item.rsi, 0) : "-"}
         </span>
+        {d && d.scoreDelta !== 0 && (
+          <span
+            style={{ ...styles.deltaChip, color: d.scoreDelta > 0 ? UP : DOWN }}
+            title={`${d.baseDate} 완성 봉 대비 ${d.scoreDelta > 0 ? "+" : ""}${d.scoreDelta}점`}
+          >
+            {d.scoreDelta > 0 ? `▲${d.scoreDelta}` : `▼${Math.abs(d.scoreDelta)}`}
+          </span>
+        )}
         <button
           style={{ ...styles.sigScore, ...styles.sigScoreBtn, color: grade.color }}
           onClick={() => setShowBreakdown(true)}
@@ -2652,6 +2843,18 @@ function SignalCard({ item, onReasonClick }) {
           {item.score > 0 ? `+${item.score}` : item.score}점 ▸
         </button>
       </div>
+      {/* 장중 배지 — 왜 점수가 안 움직이는지를 먼저 말해 준다.
+          채점은 완성 봉만 쓰므로(장중 repaint 방지) 현재가와 기준 봉이 다르다. */}
+      {item.intraday && (
+        <div style={styles.intradayBar}>
+          🕐 장중 · 신호는 <b>{item.barDate} 종가</b> 기준입니다
+          {item.livePrice != null && ` (현재가 ${fmtNum(item.livePrice, 2)})`}
+          <div style={styles.intradayNote}>
+            오늘 봉은 아직 안 끝나서 채점에 쓰지 않습니다. 장중에 켜졌다 꺼지는 신호를
+            보지 않으려는 것이며, 아래 수치는 모두 그 종가 기준입니다.
+          </div>
+        </div>
+      )}
       {verdict && (
         <div style={{ ...styles.verdictBar, borderLeftColor: verdict.tone }}>
           <div style={{ ...styles.verdictTag, color: verdict.tone }}>
@@ -2697,6 +2900,7 @@ function SignalCard({ item, onReasonClick }) {
               reason={r}
               color={grade.color}
               onReasonClick={onReasonClick}
+              isNew={newLabels.includes(r.label)}
             />
           ))
         ) : (
@@ -2705,15 +2909,23 @@ function SignalCard({ item, onReasonClick }) {
           </span>
         )}
       </div>
-      <button style={styles.breakdownBtn} onClick={() => setShowBreakdown(true)}>
-        🧮 점수 계산 자세히
-      </button>
+      <div style={styles.sigCardBtns}>
+        <button style={styles.breakdownBtn} onClick={() => setShowBreakdown(true)}>
+          🧮 점수 계산 자세히
+        </button>
+        <button style={styles.recordBtn} onClick={() => setShowRecord(true)}>
+          📝 기록
+        </button>
+      </div>
       {showBreakdown && (
         <ScoreBreakdownModal
           item={item}
           grade={grade}
           onClose={() => setShowBreakdown(false)}
         />
+      )}
+      {showRecord && (
+        <TradeEntryModal item={item} onClose={() => setShowRecord(false)} />
       )}
     </div>
   );
@@ -2722,14 +2934,22 @@ function SignalCard({ item, onReasonClick }) {
 function RecommendPanel({ onReasonClick }) {
   const { loading, data, error, time, refresh } = useSignals();
 
+  // 변화 감지(U3): 직전 완성 봉 대비 델타를 종목별로 붙이고 패널 요약을 만든다.
+  const { items, summary, nextSnap } = useMemo(() => computeDeltas(data), [data]);
+  // 스냅샷 저장은 렌더 후 부수효과로(순수 계산과 분리). 같은 data면 nextSnap이
+  //  안정적이라 매 렌더 쓰지 않는다.
+  useEffect(() => {
+    if (nextSnap) writeSnap(nextSnap);
+  }, [nextSnap]);
+
   // 종합 점수(확신) 기준으로만 정렬한다. 진입 위치(⑬)·신선도(⑫)는 점수/순서에
   //  개입하지 않고 카드의 표시 정보로만 보여준다(검증되지 않은 가중을 순위에 넣지 않음).
   const { buys, sells } = useMemo(() => {
-    if (!data) return { buys: [], sells: [] };
-    const b = data.filter((d) => d.score >= 3).sort((x, y) => y.score - x.score);
-    const s = data.filter((d) => d.score <= -3).sort((x, y) => x.score - y.score);
+    if (!items) return { buys: [], sells: [] };
+    const b = items.filter((d) => d.score >= 3).sort((x, y) => y.score - x.score);
+    const s = items.filter((d) => d.score <= -3).sort((x, y) => x.score - y.score);
     return { buys: b, sells: s };
-  }, [data]);
+  }, [items]);
 
   return (
     <section style={{ marginBottom: 28 }}>
@@ -2760,6 +2980,30 @@ function RecommendPanel({ onReasonClick }) {
         <b>"오를 종목"이 아닙니다.</b> → 아래 🔬 신호 검증 패널에서 직접
         확인하세요.
       </div>
+
+      {/* 변화 감지(U3): 직전 완성 봉 대비 목록 진입/이탈 요약. 사실만 서술한다.
+          첫 조회(summary=null)면 표시하지 않는다 — 기준이 없으면 델타도 없다. */}
+      {summary && (summary.newlyExposed.length > 0 || summary.dropped.length > 0) && (
+        <div style={styles.changeBar}>
+          <span style={styles.changeTag}>🔁 직전 완성 봉 대비</span>
+          {summary.newlyExposed.length > 0 && (
+            <span style={styles.changeGroup}>
+              <span style={{ color: "#9a9a9a" }}>새로 ±3 진입:</span>{" "}
+              {summary.newlyExposed
+                .map((x) => `${x.name}(${x.score > 0 ? "+" : ""}${x.score})`)
+                .join(", ")}
+            </span>
+          )}
+          {summary.dropped.length > 0 && (
+            <span style={styles.changeGroup}>
+              <span style={{ color: "#9a9a9a" }}>목록에서 빠짐:</span>{" "}
+              {summary.dropped
+                .map((x) => `${x.name}(${x.prevScore > 0 ? "+" : ""}${x.prevScore}→중립)`)
+                .join(", ")}
+            </span>
+          )}
+        </div>
+      )}
 
       {error ? (
         <div style={styles.recEmpty}>분석 데이터를 불러오지 못했습니다.</div>
@@ -3216,6 +3460,531 @@ function Skeleton({ lines = 1, inline = false }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  매매일지 (U4) — 내 재량 판단을 측정한다                                 */
+/* ------------------------------------------------------------------ */
+// 15년 백테스트가 말하는 건 "이 10개 신호를 기계적으로 합산하면 우위가 없다"이지,
+//  "당신의 판단에 우위가 없다"가 아니다. 화면을 보고 실적·뉴스·업황을 얹어 내리는
+//  재량 판단은 한 번도 측정된 적이 없다. 그걸 재는 유일한 방법이 '기록'이다.
+//  ⚠️ 진입 시점의 점수·신호 라벨을 '그때 그대로' 박제한다(나중에 재계산 금지).
+//  ⚠️ 절대 수익률만 보면 베타(시장이 오른 것)를 알파(내 판단)로 착각한다 →
+//   청산 시 같은 기간 벤치마크 대비 '초과'를 함께 박제한다(백테스트와 같은 언어).
+const JOURNAL_KEY = "stockdash.journal.v1";
+const journalListeners = new Set();
+function loadJournal() {
+  try {
+    return JSON.parse(localStorage.getItem(JOURNAL_KEY))?.trades || [];
+  } catch {
+    return [];
+  }
+}
+function saveJournal(trades) {
+  try {
+    localStorage.setItem(JOURNAL_KEY, JSON.stringify({ trades }));
+  } catch {
+    /* 용량 초과 등은 무시 */
+  }
+  journalListeners.forEach((fn) => fn());
+}
+const journalStore = {
+  get: loadJournal,
+  add(t) {
+    const ts = loadJournal();
+    ts.push(t);
+    saveJournal(ts);
+  },
+  update(id, patch) {
+    saveJournal(loadJournal().map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  },
+  remove(id) {
+    saveJournal(loadJournal().filter((t) => t.id !== id));
+  },
+  merge(incoming) {
+    // id 기준 병합(가져온 것이 우선). 브라우저 하나 날려도 export 파일로 복구된다.
+    const byId = new Map(loadJournal().map((t) => [t.id, t]));
+    for (const t of incoming) if (t && t.id) byId.set(t.id, t);
+    saveJournal([...byId.values()]);
+  },
+};
+function useJournal() {
+  const [trades, setTrades] = useState(loadJournal);
+  useEffect(() => {
+    const fn = () => setTrades(loadJournal());
+    journalListeners.add(fn);
+    return () => journalListeners.delete(fn);
+  }, []);
+  return trades;
+}
+
+const jMean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+const jMedian = (a) => {
+  if (!a.length) return null;
+  const s = [...a].sort((x, y) => x - y);
+  const n = s.length;
+  return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+};
+const daysBetween = (a, b) => Math.max(0, Math.round((Date.parse(b) - Date.parse(a)) / 86400000));
+const todayYmd = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+// 청산 시 벤치마크(미국=SPY / 한국=KOSPI) 같은 기간 수익률 대비 초과를 계산해 박제.
+async function computeBenchExcess(trade, exitPrice, exitDate) {
+  try {
+    const bench = benchmarkFor(trade.symbol);
+    const { rows } = await fetchSeriesLive(bench, "2y", "1d");
+    const entryRow = rows.find((r) => r.date >= trade.entryDate);
+    const exitRow = [...rows].reverse().find((r) => r.date <= exitDate);
+    if (!entryRow?.close || !exitRow?.close) return { benchRetPct: null, exPct: null };
+    const benchRet = ((exitRow.close - entryRow.close) / entryRow.close) * 100;
+    const dir = trade.side === "buy" ? 1 : -1;
+    const myRet = ((exitPrice - trade.entryPrice) / trade.entryPrice) * 100 * dir;
+    // 방향 보정: 매도 거래의 기준선은 시장 하락(= −benchRet).
+    return { benchRetPct: benchRet, exPct: myRet - dir * benchRet };
+  } catch {
+    return { benchRetPct: null, exPct: null };
+  }
+}
+
+function aggregateJournal(trades) {
+  const closed = trades.filter((t) => t.exit);
+  if (!closed.length) return null;
+  const rets = closed.map((t) => t.exit.retPct);
+  const exs = closed.map((t) => t.exit.exPct).filter((v) => v != null);
+  const Rs = closed.map((t) => t.exit.R).filter((v) => v != null);
+  const dates = closed.map((t) => t.exit.exitDate).sort();
+  return {
+    n: closed.length,
+    avgRet: jMean(rets),
+    medRet: jMedian(rets),
+    winRate: (rets.filter((r) => r > 0).length / rets.length) * 100,
+    avgEx: jMean(exs),
+    exN: exs.length,
+    avgR: jMean(Rs),
+    from: dates[0],
+    to: dates[dates.length - 1],
+  };
+}
+
+// 진입 기록 모달. 점수·신호·ATR은 '여는 순간' 박제한다(재계산 금지).
+function TradeEntryModal({ item, onClose }) {
+  const [side, setSide] = useState(item.score >= 0 ? "buy" : "sell");
+  const [entryDate, setEntryDate] = useState(todayYmd());
+  const [entryPrice, setEntryPrice] = useState(String(item.livePrice ?? item.price ?? ""));
+  const [memo, setMemo] = useState("");
+  const snap = useRef({
+    score: item.score,
+    barDate: item.barDate,
+    signals: activeLabels(item),
+    entryLevel: item.entry?.level ?? null,
+    atr: item.risk?.atr ?? null,
+    riskDist: item.risk?.atr != null ? 2 * item.risk.atr : null, // 1R = 2×ATR(카드 손절폭)
+  }).current;
+
+  const save = () => {
+    const price = parseFloat(entryPrice);
+    if (!price || price <= 0) return;
+    journalStore.add({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      symbol: item.symbol,
+      name: item.name,
+      side,
+      entryDate,
+      entryPrice: price,
+      score: snap.score,
+      barDate: snap.barDate,
+      signals: snap.signals,
+      entryLevel: snap.entryLevel,
+      atr: snap.atr,
+      riskDist: snap.riskDist,
+      memo: memo.trim(),
+      createdAt: Date.now(),
+      exit: null,
+    });
+    onClose();
+  };
+
+  return (
+    <div style={styles.modalBackdrop} onClick={onClose}>
+      <div style={styles.modalBox} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHead}>
+          <div>
+            <span style={styles.modalTitle}>{item.name}</span>
+            <span style={styles.modalSym}>진입 기록</span>
+          </div>
+          <button style={styles.modalClose} onClick={onClose}>
+            ✕
+          </button>
+        </div>
+
+        <div style={styles.jForm}>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>방향</span>
+            <div style={styles.jSideGroup}>
+              {[
+                ["buy", "매수"],
+                ["sell", "매도"],
+              ].map(([v, l]) => (
+                <button
+                  key={v}
+                  onClick={() => setSide(v)}
+                  style={{
+                    ...styles.jSideBtn,
+                    ...(side === v
+                      ? { borderColor: v === "buy" ? UP : DOWN, color: v === "buy" ? UP : DOWN }
+                      : null),
+                  }}
+                >
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>진입일</span>
+            <input
+              type="date"
+              value={entryDate}
+              onChange={(e) => setEntryDate(e.target.value)}
+              style={styles.jInput}
+            />
+          </div>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>진입가</span>
+            <input
+              type="number"
+              value={entryPrice}
+              onChange={(e) => setEntryPrice(e.target.value)}
+              style={styles.jInput}
+            />
+          </div>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>메모</span>
+            <textarea
+              value={memo}
+              onChange={(e) => setMemo(e.target.value)}
+              placeholder="이 진입의 재량 근거(실적·뉴스·업황 등). 나중에 승률과 함께 되돌아본다."
+              style={styles.jTextarea}
+            />
+          </div>
+        </div>
+
+        <div style={styles.jSnapBox}>
+          <b>박제되는 값</b> (진입 시점 그대로 · 나중에 재계산하지 않음)
+          <div style={styles.jSnapLine}>
+            점수 {snap.score > 0 ? `+${snap.score}` : snap.score} · 기준봉 {snap.barDate} ·
+            1R {snap.riskDist != null ? fmtNum(snap.riskDist, 2) : "-"}
+          </div>
+          <div style={styles.jSnapLine}>
+            신호: {snap.signals.length ? snap.signals.join(", ") : "없음"}
+          </div>
+        </div>
+
+        <div style={styles.jActions}>
+          <button style={styles.toolBtn} onClick={onClose}>
+            취소
+          </button>
+          <button style={styles.jPrimaryBtn} onClick={save}>
+            기록
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 청산 기록 모달. 수익률·R·보유일 자동 계산 + 벤치마크 초과 박제.
+function CloseTradeModal({ trade, onClose }) {
+  const [exitDate, setExitDate] = useState(todayYmd());
+  const [exitPrice, setExitPrice] = useState("");
+  const [reason, setReason] = useState("재량");
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    const price = parseFloat(exitPrice);
+    if (!price || price <= 0) return;
+    const dir = trade.side === "buy" ? 1 : -1;
+    const retPct = ((price - trade.entryPrice) / trade.entryPrice) * 100 * dir;
+    const R = trade.riskDist ? ((price - trade.entryPrice) * dir) / trade.riskDist : null;
+    const holdDays = daysBetween(trade.entryDate, exitDate);
+    setBusy(true);
+    const { benchRetPct, exPct } = await computeBenchExcess(trade, price, exitDate);
+    journalStore.update(trade.id, {
+      exit: { exitDate, exitPrice: price, reason, retPct, R, holdDays, benchRetPct, exPct },
+    });
+    setBusy(false);
+    onClose();
+  };
+
+  return (
+    <div style={styles.modalBackdrop} onClick={onClose}>
+      <div style={styles.modalBox} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHead}>
+          <div>
+            <span style={styles.modalTitle}>{trade.name}</span>
+            <span style={styles.modalSym}>청산 기록</span>
+          </div>
+          <button style={styles.modalClose} onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <div style={styles.jSnapLine}>
+          {trade.side === "buy" ? "매수" : "매도"} · 진입 {trade.entryDate} @{" "}
+          {fmtNum(trade.entryPrice, 2)}
+        </div>
+        <div style={styles.jForm}>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>청산일</span>
+            <input
+              type="date"
+              value={exitDate}
+              onChange={(e) => setExitDate(e.target.value)}
+              style={styles.jInput}
+            />
+          </div>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>청산가</span>
+            <input
+              type="number"
+              value={exitPrice}
+              onChange={(e) => setExitPrice(e.target.value)}
+              style={styles.jInput}
+            />
+          </div>
+          <div style={styles.jFormRow}>
+            <span style={styles.jFormLabel}>사유</span>
+            <select value={reason} onChange={(e) => setReason(e.target.value)} style={styles.jInput}>
+              {["목표", "손절", "시간", "재량"].map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div style={styles.jActions}>
+          <button style={styles.toolBtn} onClick={onClose} disabled={busy}>
+            취소
+          </button>
+          <button style={styles.jPrimaryBtn} onClick={save} disabled={busy}>
+            {busy ? "계산 중…" : "청산 확정"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function JournalPanel() {
+  const trades = useJournal();
+  const [closing, setClosing] = useState(null);
+  const [showClosed, setShowClosed] = useState(false);
+  const open = trades.filter((t) => !t.exit);
+  const closed = trades
+    .filter((t) => t.exit)
+    .sort((a, b) => (a.exit.exitDate < b.exit.exitDate ? 1 : -1));
+  const agg = aggregateJournal(trades);
+  const fileRef = useRef(null);
+
+  const exportJson = () => {
+    const blob = new Blob([JSON.stringify({ trades }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `stockdash-journal-${todayYmd()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importJson = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const arr = Array.isArray(parsed) ? parsed : parsed.trades;
+        if (Array.isArray(arr)) journalStore.merge(arr);
+      } catch {
+        /* 잘못된 파일 무시 */
+      }
+      e.target.value = "";
+    };
+    reader.readAsText(file);
+  };
+
+  const pctColor = (v) => (v == null ? "#999" : v > 0 ? UP : v < 0 ? DOWN : "#bbb");
+  const fmtPct = (v, d = 1) => (v == null ? "-" : `${v > 0 ? "+" : ""}${fmtNum(v, d)}%`);
+
+  return (
+    <section style={{ marginBottom: 28 }}>
+      <div style={styles.recHead}>
+        <h2 style={{ ...styles.h2, margin: 0 }}>📓 매매일지 — 내 판단을 측정한다</h2>
+        <div style={styles.recHeadRight}>
+          <button style={styles.toolBtn} onClick={exportJson} disabled={!trades.length}>
+            ⬇ 내보내기
+          </button>
+          <button style={styles.toolBtn} onClick={() => fileRef.current?.click()}>
+            ⬆ 가져오기
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            onChange={importJson}
+            style={{ display: "none" }}
+          />
+        </div>
+      </div>
+
+      <div style={styles.jHelp}>
+        신호 점수 자체는 15년 검증에서 우위가 없었습니다(초과수익 +0.1%p). 하지만{" "}
+        <b>화면을 보고 내리는 재량 판단</b>은 측정된 적이 없습니다. 그걸 재는 유일한 방법이
+        기록입니다. 카드의 <b>📝 기록</b>으로 진입을 남기고 청산하면, 같은 기간{" "}
+        <b>벤치마크 대비 초과수익</b>으로 집계합니다(절대 수익률만 보면 시장이 오른 것을 내
+        실력으로 착각합니다).
+      </div>
+
+      {trades.length === 0 ? (
+        <div style={styles.recEmpty}>
+          아직 기록이 없습니다. 신호 종합 카드의 <b>📝 기록</b> 버튼으로 진입을 남겨 보세요.
+        </div>
+      ) : (
+        <>
+          {open.length > 0 && (
+            <>
+              <div style={styles.jSubTitle}>열린 포지션 ({open.length})</div>
+              <div style={styles.jTable}>
+                {open.map((t) => (
+                  <div key={t.id} style={styles.jRow}>
+                    <span style={styles.jRowMain}>
+                      <b>{t.name}</b>
+                      <span style={{ color: t.side === "buy" ? UP : DOWN, marginLeft: 6 }}>
+                        {t.side === "buy" ? "매수" : "매도"}
+                      </span>
+                    </span>
+                    <span style={styles.jRowSub}>
+                      {t.entryDate} @ {fmtNum(t.entryPrice, 2)} · 점수{" "}
+                      {t.score > 0 ? `+${t.score}` : t.score}
+                    </span>
+                    <span style={styles.jRowActions}>
+                      <button style={styles.jSmallBtn} onClick={() => setClosing(t)}>
+                        청산
+                      </button>
+                      <button
+                        style={styles.jDelBtn}
+                        title="기록 삭제"
+                        onClick={() => journalStore.remove(t.id)}
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {agg && (
+            <div style={styles.jAggBox}>
+              <div style={styles.jAggGrid}>
+                <div style={styles.jStat}>
+                  <span style={styles.jStatLabel}>청산 거래</span>
+                  <b style={styles.jStatVal}>{agg.n}건</b>
+                </div>
+                <div style={styles.jStat}>
+                  <span style={styles.jStatLabel}>평균 / 중앙 수익</span>
+                  <b style={{ ...styles.jStatVal, color: pctColor(agg.avgRet) }}>
+                    {fmtPct(agg.avgRet)} / {fmtPct(agg.medRet)}
+                  </b>
+                </div>
+                <div style={styles.jStat}>
+                  <span style={styles.jStatLabel}>승률</span>
+                  <b style={styles.jStatVal}>{fmtNum(agg.winRate, 0)}%</b>
+                </div>
+                <div style={styles.jStat}>
+                  <span style={styles.jStatLabel}>기대 R</span>
+                  <b style={{ ...styles.jStatVal, color: pctColor(agg.avgR) }}>
+                    {agg.avgR == null ? "-" : `${agg.avgR > 0 ? "+" : ""}${fmtNum(agg.avgR, 2)}R`}
+                  </b>
+                </div>
+                <div style={styles.jStat}>
+                  <span style={styles.jStatLabel}>평균 초과 (벤치 대비)</span>
+                  <b style={{ ...styles.jStatVal, color: pctColor(agg.avgEx) }}>
+                    {agg.avgEx == null ? "-" : fmtPct(agg.avgEx)}
+                  </b>
+                </div>
+              </div>
+              <div style={styles.jAggNote}>
+                기간 {agg.from} ~ {agg.to} · 초과 표본 n={agg.exN}
+                {agg.n < 30 && (
+                  <b style={{ color: "#ffae57" }}>
+                    {" "}
+                    · ⚠️ 표본 부족(n&lt;30) — 결론 내지 말 것.
+                  </b>
+                )}
+                <br />
+                <b>초과 = 내 수익 − 같은 기간 벤치마크(방향 보정).</b> 겹치는 보유기간·소수
+                종목 상관 때문에 <b>실질 독립 표본은 n보다 적습니다.</b> 사후에 합격 기준을
+                만들지 마세요(&ldquo;이번만 빼면&rdquo; 류 금지).
+              </div>
+            </div>
+          )}
+
+          {closed.length > 0 && (
+            <>
+              <button style={styles.jToggle} onClick={() => setShowClosed((v) => !v)}>
+                {showClosed ? "▲ 청산 거래 접기" : `▼ 청산 거래 ${closed.length}건 보기`}
+              </button>
+              {showClosed && (
+                <div style={styles.jTable}>
+                  {closed.map((t) => (
+                    <div key={t.id} style={styles.jRow}>
+                      <span style={styles.jRowMain}>
+                        <b>{t.name}</b>
+                        <span style={{ color: t.side === "buy" ? UP : DOWN, marginLeft: 6 }}>
+                          {t.side === "buy" ? "매수" : "매도"}
+                        </span>
+                        <span style={{ color: "#777", marginLeft: 6, fontSize: 11 }}>
+                          {t.exit.reason}
+                        </span>
+                      </span>
+                      <span style={styles.jRowSub}>
+                        {t.entryDate}→{t.exit.exitDate} ({t.exit.holdDays}일) ·{" "}
+                        <b style={{ color: pctColor(t.exit.retPct) }}>{fmtPct(t.exit.retPct)}</b>
+                        {t.exit.R != null && ` · ${fmtNum(t.exit.R, 2)}R`}
+                        {t.exit.exPct != null && (
+                          <>
+                            {" "}
+                            · 초과{" "}
+                            <b style={{ color: pctColor(t.exit.exPct) }}>{fmtPct(t.exit.exPct)}</b>
+                          </>
+                        )}
+                      </span>
+                      <span style={styles.jRowActions}>
+                        <button
+                          style={styles.jDelBtn}
+                          title="기록 삭제"
+                          onClick={() => journalStore.remove(t.id)}
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+
+      {closing && <CloseTradeModal trade={closing} onClose={() => setClosing(null)} />}
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  메인                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -3275,6 +4044,9 @@ export default function StockDashboard() {
 
       {/* ②-b 신호 검증(백테스트) */}
       <BacktestPanel />
+
+      {/* ②-c 매매일지 (U4) */}
+      <JournalPanel />
 
       {/* ③ 관심 종목 */}
       <section>
@@ -3665,6 +4437,171 @@ const styles = {
   },
   verdictTag: { fontSize: 12.5, fontWeight: 700, lineHeight: 1.3 },
   verdictText: { fontSize: 11, color: "#b9b9b9", lineHeight: 1.45, marginTop: 3 },
+  intradayBar: {
+    padding: "6px 10px",
+    marginTop: 8,
+    borderRadius: 6,
+    border: "1px dashed #5a5a3a",
+    background: "rgba(255,210,77,0.06)",
+    fontSize: 11.5,
+    color: "#e0d9b8",
+    lineHeight: 1.4,
+  },
+  intradayNote: { fontSize: 10.5, color: "#9a927a", lineHeight: 1.45, marginTop: 3 },
+  changeBar: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "baseline",
+    gap: "6px 16px",
+    padding: "8px 12px",
+    marginBottom: 14,
+    borderRadius: 6,
+    border: "1px solid #333",
+    background: "rgba(255,255,255,0.03)",
+    fontSize: 12,
+    color: "#cfcfcf",
+  },
+  changeTag: { fontWeight: 700, color: "#bdbdbd" },
+  changeGroup: { lineHeight: 1.5 },
+  deltaChip: {
+    fontSize: 11,
+    fontWeight: 700,
+    fontVariantNumeric: "tabular-nums",
+    marginLeft: 2,
+  },
+  newTag: { fontSize: 10 },
+  sigCardBtns: { display: "flex", gap: 6, marginTop: 8 },
+  recordBtn: {
+    padding: "6px 10px",
+    borderRadius: 6,
+    border: "1px solid #3a4a5a",
+    background: "rgba(120,160,220,0.08)",
+    color: "#9fc0e8",
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  jHelp: {
+    padding: "9px 12px",
+    marginBottom: 12,
+    borderRadius: 6,
+    border: "1px solid #333",
+    background: "rgba(255,255,255,0.02)",
+    fontSize: 12,
+    color: "#c2c2c2",
+    lineHeight: 1.55,
+  },
+  jSubTitle: { fontSize: 12.5, fontWeight: 700, color: "#bdbdbd", margin: "10px 0 6px" },
+  jTable: { display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 },
+  jRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    flexWrap: "wrap",
+    padding: "7px 10px",
+    borderRadius: 6,
+    border: "1px solid #2e2e2e",
+    background: "rgba(255,255,255,0.02)",
+  },
+  jRowMain: { fontSize: 13, minWidth: 110 },
+  jRowSub: { fontSize: 11.5, color: "#aaa", flex: 1, minWidth: 180 },
+  jRowActions: { display: "flex", gap: 6, marginLeft: "auto" },
+  jSmallBtn: {
+    padding: "4px 10px",
+    borderRadius: 5,
+    border: "1px solid #4a4a4a",
+    background: "#2a2a2a",
+    color: "#ddd",
+    fontSize: 11.5,
+    cursor: "pointer",
+  },
+  jDelBtn: {
+    padding: "4px 8px",
+    borderRadius: 5,
+    border: "1px solid #443",
+    background: "transparent",
+    color: "#977",
+    fontSize: 11,
+    cursor: "pointer",
+  },
+  jToggle: {
+    background: "none",
+    border: "none",
+    color: "#8ab",
+    fontSize: 12,
+    cursor: "pointer",
+    padding: "4px 0",
+  },
+  jAggBox: {
+    padding: "10px 12px",
+    borderRadius: 8,
+    border: "1px solid #333",
+    background: "rgba(255,255,255,0.03)",
+    marginBottom: 8,
+  },
+  jAggGrid: { display: "flex", flexWrap: "wrap", gap: "10px 22px" },
+  jStat: { display: "flex", flexDirection: "column", gap: 2 },
+  jStatLabel: { fontSize: 10.5, color: "#8a8a8a" },
+  jStatVal: { fontSize: 15, fontWeight: 700, fontVariantNumeric: "tabular-nums" },
+  jAggNote: { fontSize: 11, color: "#9a9a9a", lineHeight: 1.5, marginTop: 8 },
+  jForm: { display: "flex", flexDirection: "column", gap: 10, margin: "12px 0" },
+  jFormRow: { display: "flex", alignItems: "flex-start", gap: 10 },
+  jFormLabel: { width: 52, fontSize: 12.5, color: "#aaa", paddingTop: 6, flexShrink: 0 },
+  jInput: {
+    flex: 1,
+    padding: "6px 9px",
+    borderRadius: 6,
+    border: "1px solid #444",
+    background: "#1c1c1c",
+    color: "#eee",
+    fontSize: 13,
+  },
+  jTextarea: {
+    flex: 1,
+    minHeight: 54,
+    padding: "6px 9px",
+    borderRadius: 6,
+    border: "1px solid #444",
+    background: "#1c1c1c",
+    color: "#eee",
+    fontSize: 12.5,
+    resize: "vertical",
+    fontFamily: "inherit",
+  },
+  jSideGroup: { display: "flex", gap: 6, flex: 1 },
+  jSideBtn: {
+    flex: 1,
+    padding: "6px 0",
+    borderRadius: 6,
+    border: "1px solid #444",
+    background: "#1c1c1c",
+    color: "#999",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  jSnapBox: {
+    padding: "8px 10px",
+    borderRadius: 6,
+    border: "1px dashed #444",
+    background: "rgba(255,255,255,0.02)",
+    fontSize: 11.5,
+    color: "#bbb",
+    lineHeight: 1.5,
+  },
+  jSnapLine: { fontSize: 11.5, color: "#9a9a9a", marginTop: 3 },
+  jActions: { display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 },
+  jPrimaryBtn: {
+    padding: "7px 16px",
+    borderRadius: 6,
+    border: "1px solid #3a6a4a",
+    background: "rgba(80,180,120,0.15)",
+    color: "#7bd88f",
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
   reasonTip: {
     position: "absolute",
     top: "calc(100% + 6px)",
