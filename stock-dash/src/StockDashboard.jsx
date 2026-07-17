@@ -82,17 +82,31 @@ const INTERVAL_OPTIONS = [
 /* ------------------------------------------------------------------ */
 
 // Yahoo Finance chart API 호출 (corsproxy 경유)
-async function fetchChart(symbol, range = "1d", interval = "1d") {
+//  ⚠️ D4: corsproxy.io는 단일 장애점(SPOF)이다. 죽으면 앱 전체가 멈춘다.
+//   폴백 프록시를 찾으려 했으나(2026-07-16 브라우저 실측) allorigins·thingproxy·codetabs가
+//   모두 Yahoo에 대해 동작하지 않았고, 성공한 것은 corsproxy.io 변형뿐이라(같은 제공자)
+//   독립적 폴백이 되지 못했다. 그래서 (1) 일시적 실패 1회 재시도, (2) 실패 시 명확한
+//   사용자 안내(RecommendPanel/차트 에러 문구)로 대응한다. SPOF 위험 자체는 남아 있다.
+async function fetchChart(symbol, range = "1d", interval = "1d", attempt = 0) {
   const target = `${BASE}${encodeURIComponent(
     symbol
   )}?range=${range}&interval=${interval}`;
   const url = `${PROXY}${encodeURIComponent(target)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  const result = json?.chart?.result?.[0];
-  if (!result) throw new Error("No data");
-  return result;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result) throw new Error("No data");
+    return result;
+  } catch (e) {
+    // 일시적 네트워크/프록시 오류는 짧은 지연 후 1회 재시도. 그래도 실패하면 던진다.
+    if (attempt < 1) {
+      await new Promise((r) => setTimeout(r, 600));
+      return fetchChart(symbol, range, interval, attempt + 1);
+    }
+    throw e;
+  }
 }
 
 // 지수/종목의 현재가·전일대비 요약
@@ -135,6 +149,15 @@ function fmtYmd(epochSec) {
   const d = new Date(epochSec * 1000);
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// "YYYY-MM-DD" → 그 주의 월요일 날짜(주 식별 키). 주봉 완성 여부 판정용(⑥ repaint 방지).
+//  두 날짜가 같은 주면 같은 키가 나온다. 타임존 하드코딩 없이 주 경계만 본다.
+function weekKey(ymd) {
+  const d = new Date(ymd + "T00:00:00Z");
+  const dow = (d.getUTCDay() + 6) % 7; // 월=0 … 일=6
+  d.setUTCDate(d.getUTCDate() - dow);
+  return d.toISOString().slice(0, 10);
 }
 
 // 지금이 그 종목의 **정규장 시간**인지 판정한다(시계 vs 거래소 정규장 구간. 봉과 무관).
@@ -350,6 +373,13 @@ async function loadAllSignals() {
       let weeklyTrend = null;
       try {
         const wk = await fetchSeries(w.symbol, "2y", "1wk");
+        // ⑥ repaint 방지: 진행 중인 '이번 주' 봉은 채점에서 제외한다(완성 주만 사용).
+        //  판정: 마지막 완성 일봉이 마지막 주봉과 같은 주면, 그 주봉은 아직 일봉으로
+        //  채워지는 중이다. 주봉은 loadSeries가 안 잘라내므로(일봉 전용) 여기서 처리.
+        //  (fetchSeries "1wk"는 미완성 주 봉을 포함해서 준다.)
+        const lastDaily = rows[rows.length - 1]?.date;
+        if (wk.length && lastDaily && weekKey(lastDaily) === weekKey(wk[wk.length - 1].date))
+          wk.pop();
         weeklyTrend = computeWeeklyTrend(wk);
       } catch {
         // 주봉 실패는 무시
@@ -357,13 +387,19 @@ async function loadAllSignals() {
 
       // 상대강도(RS): 종목 − 벤치마크 초과수익(%p)을 단기/중기 각각 산출.
       //  computeSignal에서 둘 다 강세/약세여야 신호를 부여(엇갈리면 중립).
+      //  ⚠️ D3: 벤치마크와 동일 심볼(예: SPY)은 RS = 자기 − 자기 = 0이라 신호가
+      //   구조적으로 불가능하다. null을 넘겨 '계산했는데 0'이 아니라 '해당 없음'으로
+      //   명시하고, 카드에 표기한다(selfBench). 어차피 0은 데드존이라 점수는 불변.
+      //   레짐(⑦)은 건드리지 않는다: 자기벤치의 레짐 = 시장 레짐이고, SPY의 역추세
+      //   신호를 시장 국면으로 누르는 건 SPY에도 타당하므로 순환이지만 무해하다.
+      const isSelfBench = benchmarkFor(w.symbol) === w.symbol;
       const bench = benchReturns[benchmarkFor(w.symbol)] || {};
       const retShort = periodReturn(rows, RS_SHORT);
       const retLong = periodReturn(rows, RS_LONG);
       const rsShort =
-        bench.short != null && retShort != null ? retShort - bench.short : null;
+        isSelfBench || bench.short == null || retShort == null ? null : retShort - bench.short;
       const rsLong =
-        bench.long != null && retLong != null ? retLong - bench.long : null;
+        isSelfBench || bench.long == null || retLong == null ? null : retLong - bench.long;
 
       // 지수 레짐 → 평균회귀 신호 가중 축소(대칭): 위험(하락/급락)이면 매수 축소,
       //  강세(상승/급등)이면 매도 축소.
@@ -387,11 +423,16 @@ async function loadAllSignals() {
           intraday: inSession,
           livePrice,
           barDate: rows[rows.length - 1].date,
+          selfBench: isSelfBench,
         });
     } catch {
       // 개별 종목 실패는 건너뜀
     }
   }
+  // D4: 한 종목도 못 받았으면(=프록시/네트워크 총실패) 조용히 빈 목록을 반환하지 않는다.
+  //  그러면 화면이 "±3 넘는 종목 없음"처럼 정상인 척 비어 보인다. 던져서 error 상태로
+  //  보내 명확한 안내(새로고침)를 띄운다. 유효 종목이 하나라도 있으면 정상 진행.
+  if (!results.length) throw new Error("신호 데이터를 한 종목도 불러오지 못했습니다");
   return results;
 }
 
@@ -594,6 +635,8 @@ async function loadBacktest() {
       // 개별 종목 실패는 건너뜀
     }
   }
+  // D4: 한 종목도 못 받았으면 빈 표를 정상인 척 그리지 않고 던져 error 안내를 띄운다.
+  if (!symbols) throw new Error("백테스트 데이터를 한 종목도 불러오지 못했습니다");
   const { baseline, signals, grades, delays } = aggregateBacktest(all);
   return { baseline, signals, grades, delays, symbols, total };
 }
@@ -763,6 +806,14 @@ function emaArray(values, period) {
 //  모여야 확정되므로, 마커는 시계열 끝에서 최소 DIV_PIVOT_L봉 앞에만 찍힌다.
 //  computeSignal도 같은 값으로 '확정된 마커만 채점' 가드를 건다(백테스트 look-ahead 차단).
 const DIV_PIVOT_L = 3;
+// 다이버전스로 비교하는 두 피벗의 간격 제약 (D2). 간격 제약이 없으면 5봉 떨어진
+//  피벗과 80봉 떨어진 피벗을 똑같이 비교해 노이즈가 섞인다. 너무 가까우면(<5봉)
+//  같은 스윙을 쪼갠 것이고, 너무 멀면(>60봉) 서로 다른 국면을 억지로 잇는 것이다.
+//  ⚠️ 이 제약은 markDiv(전체 시계열)에서만 걸린다 — computeSignal의 스캔창
+//   (DIV_LOOKBACK=12)은 그대로이므로 BT_SIG_WINDOW(60)와 무관하다.
+//  근거는 노이즈 제거(설계)이지 성과가 아니다.
+const DIV_MIN_GAP = 5;
+const DIV_MAX_GAP = 60;
 
 function computeIndicators(rows) {
   const closes = rows.map((r) => r.close);
@@ -1018,6 +1069,8 @@ function computeIndicators(rows) {
     for (let p = 1; p < pivots.length; p++) {
       const a = pivots[p - 1];
       const b = pivots[p];
+      const gap = b - a; // 두 피벗 간 거리(봉). 노이즈 제거용 하한/상한(D2).
+      if (gap < DIV_MIN_GAP || gap > DIV_MAX_GAP) continue;
       const oa = out[a][oscKey];
       const ob = out[b][oscKey];
       if (oa == null || ob == null) continue;
@@ -1323,10 +1376,13 @@ function computeSignal(rows, ctx = {}) {
   //   추세장 ADX≥25 = 추세추종(MACD 강크로스·MA배열) / 횡보장 ADX<20 = 평균회귀(RSI·볼린저)
   //   전환 구간(20~25)은 보너스 없음. ⑦(벤치 추세 기반)과 달리 '종목' ADX라 독립적.
   //  방향은 현재 종합 점수 부호로 결정해 우세 방향만 강화(상반 신호 혼재 시 보너스 보류).
+  //  ⚠️ 게이트가 |score|≥3(노출 임계)이다: '이미 노출된 종목의 천장만' 올린다. 부호(>0)만
+  //   보면 +2 종목을 +3으로 밀어 하단 컷을 낮춰 노출 구성을 바꾼다(문서 서술과 불일치).
+  //   근거는 문서-코드 일치(설계)이지 성과가 아니다. 만점·등급컷 숫자는 불변.
   if (last.adx != null) {
     const trendRegime = last.adx >= 25;
     const rangeRegime = last.adx < 20;
-    if (score > 0) {
+    if (score >= 3) {
       if (trendRegime && hasTrendBuy)
         addBuy(
           "추세장 추세신호 정합",
@@ -1343,7 +1399,7 @@ function computeSignal(rows, ctx = {}) {
           last.date,
           "이 종목은 ADX<20으로 추세가 약한 국면(횡보장)이고, RSI 과매도나 볼린저 하단 같은 평균회귀 매수신호가 함께 떴습니다. 횡보장에선 과매도 반등(평균회귀)이 잘 통해 신뢰도를 +1 가산합니다.\n\n⚠️ 단독 신호가 아니라 기존 평균회귀 신호에 확인 +1을 더하는 보조 신호입니다. 매수 판단은 카드 위쪽의 종합 점수·등급으로 하세요."
         );
-    } else if (score < 0) {
+    } else if (score <= -3) {
       if (trendRegime && hasTrendSell)
         addSell(
           "추세장 추세신호 정합",
@@ -2122,7 +2178,10 @@ function ChartPanel({ symbol, highlight }) {
     return (
       <div style={{ padding: "8px 16px 20px" }}>
         {toolbar}
-        <div style={{ padding: 24, color: "#ff7a7a" }}>데이터 오류</div>
+        <div style={{ padding: 24, color: "#ff7a7a" }}>
+          데이터 오류 — 프록시(corsproxy.io)·네트워크 문제일 수 있습니다. 잠시 후 다시 열어
+          보세요.
+        </div>
       </div>
     );
   if (!data)
@@ -2855,6 +2914,12 @@ function SignalCard({ item, onReasonClick }) {
           </div>
         </div>
       )}
+      {item.selfBench && (
+        <div style={styles.selfBenchNote}>
+          ℹ️ 이 종목은 <b>벤치마크 자신</b>입니다 — 시장 대비 상대강도(RS)는 자기 자신과의
+          비교라 적용하지 않습니다.
+        </div>
+      )}
       {verdict && (
         <div style={{ ...styles.verdictBar, borderLeftColor: verdict.tone }}>
           <div style={{ ...styles.verdictTag, color: verdict.tone }}>
@@ -3006,7 +3071,10 @@ function RecommendPanel({ onReasonClick }) {
       )}
 
       {error ? (
-        <div style={styles.recEmpty}>분석 데이터를 불러오지 못했습니다.</div>
+        <div style={styles.recEmpty}>
+          분석 데이터를 불러오지 못했습니다. 데이터 제공 프록시(corsproxy.io) 또는
+          네트워크 문제일 수 있습니다 — <b>↻ 새로고침</b>을 눌러 다시 시도해 보세요.
+        </div>
       ) : loading && !data ? (
         <div style={styles.recEmpty}>
           관심종목 {WATCHLIST.length}개의 지표를 분석하는 중…
@@ -3247,7 +3315,10 @@ function BacktestPanel() {
           (무거운 계산이라 펼칠 때 1회 실행)
         </div>
       ) : error ? (
-        <div style={styles.recEmpty}>백테스트 데이터를 불러오지 못했습니다.</div>
+        <div style={styles.recEmpty}>
+          백테스트 데이터를 불러오지 못했습니다. 프록시(corsproxy.io)·네트워크 문제일 수
+          있으니 잠시 후 다시 시도해 보세요.
+        </div>
       ) : loading && !data ? (
         <div style={styles.recEmpty}>
           관심종목 {WATCHLIST.length}개의 15년 일봉으로 과거 신호를 검증하는 중… (시세 내려받기
@@ -4448,6 +4519,16 @@ const styles = {
     lineHeight: 1.4,
   },
   intradayNote: { fontSize: 10.5, color: "#9a927a", lineHeight: 1.45, marginTop: 3 },
+  selfBenchNote: {
+    padding: "6px 10px",
+    marginTop: 8,
+    borderRadius: 6,
+    border: "1px solid #333",
+    background: "rgba(255,255,255,0.02)",
+    fontSize: 11,
+    color: "#a8a8a8",
+    lineHeight: 1.45,
+  },
   changeBar: {
     display: "flex",
     flexWrap: "wrap",
